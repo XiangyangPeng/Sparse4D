@@ -67,15 +67,15 @@ class Sparse4DHead(BaseModule):
         else:
             self.reg_weights = reg_weights
 
-        if operation_order is None:
+        if operation_order is None: # 默认v1
             operation_order = [
-                "gnn",
+                "gnn", # self attention
                 "norm",
-                "deformable",
+                "deformable", # 特征采样、聚合
                 "norm",
-                "ffn",
-                "norm",
-                "refine",
+                "ffn", # 全连接层
+                "norm", # norm在两个功能层中间
+                "refine", # 回归层
             ] * num_decoder
         self.operation_order = operation_order
 
@@ -131,19 +131,21 @@ class Sparse4DHead(BaseModule):
         if isinstance(feature_maps, torch.Tensor):
             feature_maps = [feature_maps]
         batch_size = feature_maps[0].shape[0]
+        # 得到anchor和instance_feature（当前帧+历史帧）
         (
-            instance_feature,
-            anchor,
-            temp_instance_feature,
-            temp_anchor,
-            time_interval,
+            instance_feature, # bs * n_anchors * embed_dims。当前帧
+            anchor, # bs * n_anchors * anchor_dims
+            temp_instance_feature, # bs * n_temp_instances * embed_dims。上一帧
+            temp_anchor, # bs * n_temp_instances * anchor_dims。上一帧的anchor转换到当前帧
+            time_interval, # bs * 1
         ) = self.instance_bank.get(batch_size, metas)
-        anchor_embed = self.anchor_encoder(anchor)
+        anchor_embed = self.anchor_encoder(anchor) # anchor 生成 anchor embedding。 bs * n_anchors * embed_dims
         if temp_anchor is not None:
             temp_anchor_embed = self.anchor_encoder(temp_anchor)
         else:
             temp_anchor_embed = None
 
+        # 从insatnce_bank提取历史帧的特征图和元信息
         _feature_queue = self.instance_bank.feature_queue
         _meta_queue = self.instance_bank.meta_queue
         if feature_queue is not None and _feature_queue is not None:
@@ -155,39 +157,45 @@ class Sparse4DHead(BaseModule):
 
         prediction = []
         classification = []
+        # 特征聚合、检测头（v1 v2 有区别）
         for i, op in enumerate(self.operation_order):
-            if op == "temp_gnn":
+            if op == "temp_gnn": # CA
                 instance_feature = self.layers[i](
-                    instance_feature,
-                    temp_instance_feature,
-                    temp_instance_feature,
-                    query_pos=anchor_embed,
-                    key_pos=temp_anchor_embed,
-                )
-            elif op == "gnn":
+                    instance_feature, # 当前帧的实例特征，堆叠的模块中不断更新。Query. bs * n_anchors * embed_dims. (batch_first=True)
+                    temp_instance_feature, # 上一帧的实例特征，不会更新。Key. bs * n_temp_instances * embed_dims
+                    temp_instance_feature, # Value
+                    query_pos=anchor_embed, # 当前帧的anchor embedding，不断更新
+                    key_pos=temp_anchor_embed, # 上一帧的anchor embedding，不断更新
+                ) # bs * n_anchors * embed_dims
+            elif op == "gnn": # SA
                 instance_feature = self.layers[i](
-                    instance_feature,
+                    instance_feature, # Q K V. bs * n_anchors * embed_dims
                     query_pos=anchor_embed,
-                )
+                ) # bs * n_anchors * embed_dims
             elif op == "norm" or op == "ffn":
                 instance_feature = self.layers[i](instance_feature)
             elif op == "identity":
                 identity = instance_feature
             elif op == "add":
                 instance_feature = instance_feature + identity
-            elif op == "deformable":
+            elif op == "deformable": # 每一次迭代，都会基于refine后的anchor-keypoints进行特征采样、融合
+                # multi-view multi-level multi-timestamp multi-keypoints 特征采样与融合
                 instance_feature = self.layers[i](
-                    instance_feature,
-                    anchor,
-                    anchor_embed,
-                    feature_maps,
+                    # 当前帧信息
+                    instance_feature, # 实例特征。bs * n_anchors * embed_dims
+                    anchor, # 锚点。bs * n_anchors * anchor_dims
+                    anchor_embed, # 锚点embedding。bs * n_anchors * embed_dims
+                    feature_maps, # 特征图。n_levels * [bs * n_cams * n_channels * W * H]
                     metas,
-                    feature_queue=feature_queue,
-                    meta_queue=meta_queue,
+                    # 历史帧信息
+                    feature_queue=feature_queue, # 历史帧的特征图
+                    meta_queue=meta_queue, # 历史帧的元信息
+                    # 模块
                     depth_module=self.depth_module,
                     anchor_encoder=self.anchor_encoder,
                 )
-            elif op == "refine":
+            elif op == "refine": # 一次迭代的最后模块，对anchor/anchor embedding进行微调，并作为下一次迭代的输入
+                # box 属性回归，分类
                 anchor, cls = self.layers[i](
                     instance_feature,
                     anchor,
@@ -201,12 +209,15 @@ class Sparse4DHead(BaseModule):
                 )
                 prediction.append(anchor)
                 classification.append(cls)
-                if len(prediction) == self.num_single_frame_decoder:
+                # 组合当前帧与历史帧的实例
+                if len(prediction) == self.num_single_frame_decoder: # v2，新的实例，上一帧传递的实例，需要topk筛选
                     instance_feature, anchor = self.instance_bank.update(
                         instance_feature, anchor, cls
                     )
+                # 更新 anchor embedding
                 if i != len(self.operation_order) - 1:
                     anchor_embed = self.anchor_encoder(anchor)
+                # 更新 上一帧的 anchor embedding
                 if (
                     len(prediction) > self.num_single_frame_decoder
                     and temp_anchor_embed is not None
@@ -217,6 +228,7 @@ class Sparse4DHead(BaseModule):
             else:
                 raise NotImplementedError(f"{op} is not supported.")
 
+        # 更新instance_bank，保存当前帧(topk)
         self.instance_bank.cache(
             instance_feature, anchor, cls, metas, feature_maps
         )
