@@ -347,7 +347,7 @@ class DeformableFeatureAggregation(BaseModule):
     @staticmethod
     def feature_sampling(
         feature_maps: List[torch.Tensor], # n_levels * [bs * n_cams * n_channels * W * H]
-        key_points: torch.Tensor, # bs * n_anchor * n_pkeypoints * 3
+        key_points: torch.Tensor, # bs * n_anchor * n_keypoints * 3
         projection_mat: torch.Tensor, # 投影矩阵，
         image_wh: Optional[torch.Tensor] = None,
     ) -> torch.Tensor: # 在多视角多level的特征图上基于anchor的keypoints进行特征采样
@@ -483,11 +483,11 @@ class DepthReweightModule(BaseModule):
             / self.depth_interval
         ) # bs * n_anchors * 1 * n_depths
 
-        top2 = weights.topk(2, dim=-1)[0]
+        top2 = weights.topk(2, dim=-1)[0] # bs * n_anchors * 1 * 2
         weights = torch.where(
             weights >= top2[..., 1:2], weights, weights.new_tensor(0.0)
         )
-        scale = torch.pow(top2[..., 0:1], 2) + torch.pow(top2[..., 1:2], 2) # 归一化系数
+        scale = torch.pow(top2[..., 0:1], 2) + torch.pow(top2[..., 1:2], 2) # 归一化系数. bs * n_anchors * 1 * 1
         confidence = self.depth_fc(features).softmax(dim=-1) # bs * n_anchor * n_keypoints * n_depths
         # bs * n_anchors * n_keypoints * n_depths
         # bs * n_anchors * n_keypoints * 1
@@ -522,16 +522,21 @@ class DenseDepthNet(BaseModule):
                 nn.Conv2d(embed_dims, 1, kernel_size=1, stride=1, padding=0)
             )
 
-    def forward(self, feature_maps, focal=None, gt_depths=None):
+    def forward(self, 
+                feature_maps, 
+                focal=None, 
+                gt_depths=None):
         if focal is None:
             focal = self.equal_focal
         else:
             focal = focal.reshape(-1)
         depths = []
-        for i, feat in enumerate(feature_maps[: self.num_depth_layers]):
-            depth = self.depth_layers[i](feat.flatten(end_dim=1).float()).exp()
-            depth = (depth.T * focal / self.equal_focal).T
-            depths.append(depth)
+        for i, feat in enumerate(feature_maps[: self.num_depth_layers]): # 遍历 level
+            # bs * n_cam * n_channels * w * h ——> (bs*n_cam) * n_channels * w * h
+            # ——> (bs*n_cams) * 1 * w * h
+            depth = self.depth_layers[i](feat.flatten(end_dim=1).float()).exp() # 监督信号取log
+            depth = (depth.T * focal / self.equal_focal).T # focal ??
+            depths.append(depth) # n_levels * [(bs*n_cam) * 1 * w * h]
         if gt_depths is not None and self.training:
             loss = self.loss(depths, gt_depths)
             return loss

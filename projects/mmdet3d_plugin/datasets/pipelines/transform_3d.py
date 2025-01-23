@@ -53,12 +53,14 @@ class MultiScaleDepthMapGenerator(object):
         self.max_depth = max_depth
 
     def __call__(self, input_dict):
+        # 点云信息。bs * n_points * n_dim
         points = input_dict["points"].tensor[..., :3, None].cpu().numpy()
 
         gt_depth = []
-        for i, lidar2img in enumerate(input_dict["lidar2img"]):
+        for i, lidar2img in enumerate(input_dict["lidar2img"]): # 遍历视角图像
             H, W = input_dict["img_shape"][i][:2]
 
+            # lidar 坐标系 -> 相机坐标系
             pts_2d = (
                 np.squeeze(lidar2img[:3, :3] @ points, axis=-1)
                 + lidar2img[:3, 3]
@@ -81,7 +83,7 @@ class MultiScaleDepthMapGenerator(object):
             sort_idx = np.argsort(depths)[::-1]
             V, U, depths = V[sort_idx], U[sort_idx], depths[sort_idx]
 
-            for j, downsample in enumerate(self.downsample):
+            for j, downsample in enumerate(self.downsample): # 遍历不同下采样率，对应FPN的不同尺度
                 if len(gt_depth) < j + 1:
                     gt_depth.append([])
                 h, w = (int(H / downsample), int(W / downsample))

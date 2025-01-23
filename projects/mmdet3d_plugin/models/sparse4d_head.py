@@ -149,7 +149,7 @@ class Sparse4DHead(BaseModule):
         _feature_queue = self.instance_bank.feature_queue
         _meta_queue = self.instance_bank.meta_queue
         if feature_queue is not None and _feature_queue is not None:
-            feature_queue = feature_queue + _feature_queue
+            feature_queue = feature_queue + _feature_queue # list 的拼接
             meta_queue = meta_queue + _meta_queue
         elif feature_queue is None:
             feature_queue = _feature_queue
@@ -232,47 +232,56 @@ class Sparse4DHead(BaseModule):
         self.instance_bank.cache(
             instance_feature, anchor, cls, metas, feature_maps
         )
-        return classification, prediction
+        return classification, prediction # 多次迭代的分类、回归结果均返回
 
-    @force_fp32(apply_to=("cls_scores", "reg_preds"))
-    def loss(self, cls_scores, reg_preds, data, feature_maps=None):
+    @force_fp32(apply_to=("cls_scores", "reg_preds")) # 混合精度训练
+    def loss(self, 
+             cls_scores, # bs * n_anchors * n_classes
+             reg_preds,  # bs * n_anchors * n_state
+             data, # dict, 包含gt_cls_key, gt_reg_key
+             feature_maps=None
+             ): # 损失函数，分类focal loss， 回归smooth l1 loss
         output = {}
+        # 对每一个迭代块计算分类、回归损失
         for decoder_idx, (cls, reg) in enumerate(zip(cls_scores, reg_preds)):
-            reg = reg[..., : len(self.reg_weights)]
+            reg = reg[..., : len(self.reg_weights)] # 只监督部分属性（VZ不监督）
+            # 对每一个pred生成监督信号（匹配，set-loss）
+            # bs * n_anchors, bs * n_anchors * n_states
             cls_target, reg_target, reg_weights = self.sampler.sample(
-                cls,
-                reg,
+                cls, # bs * n_anchors * n_classes
+                reg, # bs * n_anchors * n_state_
                 data[self.gt_cls_key],
                 data[self.gt_reg_key],
             )
-            reg_target = reg_target[..., : len(self.reg_weights)]
-            mask = torch.logical_not(torch.all(reg_target == 0, dim=-1))
+            reg_target = reg_target[..., : len(self.reg_weights)] # 截取回归监督信号部分属性（VZ不监督）
+            mask = torch.logical_not(torch.all(reg_target == 0, dim=-1)) # 找到match非空的anchor。bs * n_anchors * 1
             mask_valid = mask.clone()
 
             num_pos = max(
                 reduce_mean(torch.sum(mask).to(dtype=reg.dtype)), 1.0
-            )
+            ) # 计算match上的anchor数。涉及到分布式计算
             if self.cls_threshold_to_reg > 0:
                 threshold = self.cls_threshold_to_reg
                 mask = torch.logical_and(
                     mask, cls.max(dim=-1).values.sigmoid() > threshold
                 )
-
-            cls = cls.flatten(end_dim=1)
-            cls_target = cls_target.flatten(end_dim=1)
-            cls_loss = self.loss_cls(cls, cls_target, avg_factor=num_pos)
+            # 分类损失 - focal loss
+            cls = cls.flatten(end_dim=1) # (bs*n_anchors) * n_classes
+            cls_target = cls_target.flatten(end_dim=1) # (bs*n_anchors)
+            cls_loss = self.loss_cls(cls, cls_target, avg_factor=num_pos) # focal loss 支持 非 one-hot 的target
 
             mask = mask.reshape(-1)
-            reg_weights = reg_weights * reg.new_tensor(self.reg_weights)
-            reg_target = reg_target.flatten(end_dim=1)[mask]
-            reg = reg.flatten(end_dim=1)[mask]
-            reg_weights = reg_weights.flatten(end_dim=1)[mask]
+            reg_weights = reg_weights * reg.new_tensor(self.reg_weights) # 回归权重
+            reg_target = reg_target.flatten(end_dim=1)[mask] # (bs*n_anchors) * n_states 的部分。真值
+            reg = reg.flatten(end_dim=1)[mask] # (bs*n_anchors) * n_states 的部分。预测值
+            reg_weights = reg_weights.flatten(end_dim=1)[mask] # (bs*n_anchors) * n_states 的部分
             reg_target = torch.where(
                 reg_target.isnan(), reg.new_tensor(0.0), reg_target
-            )
+            ) # 将nan替换为0
+            # 回归损失 - l1 loss
             reg_loss = self.loss_reg(
-                reg, reg_target, weight=reg_weights, avg_factor=num_pos
-            )
+                reg, reg_target, weight=reg_weights, avg_factor=num_pos # 以anchor数为归一化因子
+            ) #
 
             output.update(
                 {
@@ -281,32 +290,35 @@ class Sparse4DHead(BaseModule):
                 }
             )
 
+        # 深度损失
         if (
-            self.depth_module is not None
+            self.depth_module is not None # v1，对深度进行监督
             and self.kps_generator is not None
             and feature_maps is not None
         ):
             reg_target = self.sampler.encode_reg_target(
                 data[self.gt_reg_key], reg_preds[0].device
-            )
+            ) # bs * [n_gt * n_states]
             loss_depth = []
             for i in range(len(reg_target)):
                 if len(reg_target[i]) == 0:
                     continue
-                key_points = self.kps_generator(reg_target[i][None])
+                # 特征点采样
+                key_points = self.kps_generator(reg_target[i][None]) # bs * n_gt * n_keypoints * 3
                 features = (
                     DFG.feature_sampling(
                         [f[i : i + 1] for f in feature_maps],
                         key_points,
                         data["projection_mat"][i : i + 1],
                         data["image_wh"][i : i + 1],
-                    )
-                    .mean(2)
-                    .mean(2)
+                    ) # bs * n_gt * n_cam * n_level * n_keypoints * n_channels
+                    .mean(2) # bs * n_gt * n_level * n_keypoints * n_channels
+                    .mean(2) # bs * n_gt * n_keypoints * n_channels
                 )
+                # 基于真值anchor的采样特征进行深度加权。其实是一条单独的监督链路了
                 depth_confidence = self.depth_module(
                     features, reg_target[i][None, :, None], output_conf=True
-                )
+                ) # 返回的是真值的深度在估计的深度分布中的置信度，本身就是损失
                 loss_depth.append(-torch.log(depth_confidence).sum())
             output["loss_depth"] = (
                 sum(loss_depth) / num_pos / self.kps_generator.num_pts

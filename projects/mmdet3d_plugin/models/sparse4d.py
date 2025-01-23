@@ -66,16 +66,17 @@ class Sparse4D(BaseDetector):
             num_cams = 1
         if self.use_grid_mask:
             img = self.grid_mask(img)
+        # 提取图像特征-backbone neck
         if "metas" in signature(self.img_backbone.forward).parameters:
-            feature_maps = self.img_backbone(img, num_cams, metas=metas)
+            feature_maps = self.img_backbone(img, num_cams, metas=metas) # n_level * [(bs*n_cams) * C * H/@ * W/@]
         else:
-            feature_maps = self.img_backbone(img)
+            feature_maps = self.img_backbone(img) 
         if self.img_neck is not None:
-            feature_maps = list(self.img_neck(feature_maps))
+            feature_maps = list(self.img_neck(feature_maps)) # n_level * [(bs*n_cams) * C * H/@ * W/@]
         for i, feat in enumerate(feature_maps):
             feature_maps[i] = torch.reshape(
                 feat, (bs, num_cams) + feat.shape[1:]
-            )
+            ) # n_level * [bs * n_cams * C * H/@ * W/@]
         if return_depth and self.depth_branch is not None:
             depths = self.depth_branch(feature_maps, metas.get("focal"))
         else:
@@ -93,10 +94,13 @@ class Sparse4D(BaseDetector):
         else:
             return self.forward_test(**data)
 
-    def forward_train(self, **data):
-        img = data.pop("img")
-        feature_maps, depths = self.extract_feat(img, True, data)
+    def forward_train(self, 
+                      **data # 输入多个参数，打包成字典
+                      ):
+        img = data.pop("img") # 从data中提取img
+        feature_maps, depths = self.extract_feat(img, True, data) # 提取特征图和深度图
 
+        # 加载历史帧 or 未来帧（和bank 的关系？）
         if "data_queue" in data or "future_data_queue" in data:
             feature_queue = []
             meta_queue = []
@@ -111,6 +115,8 @@ class Sparse4D(BaseDetector):
             feature_queue = None
             meta_queue = None
 
+        # head 部分
+        # bs * n_anchors * n_classes, bs * n_anchors * n_state
         cls_scores, reg_preds = self.head(
             feature_maps, data, feature_queue, meta_queue
         )
@@ -118,6 +124,7 @@ class Sparse4D(BaseDetector):
             feature_maps = DAF.feature_maps_format(feature_maps, inverse=True)
         output = self.head.loss(cls_scores, reg_preds, data, feature_maps)
         if depths is not None and "gt_depth" in data:
+            # 引入lidar，对深度进行密集监督
             output["loss_dense_depth"] = self.depth_branch.loss(
                 depths, data["gt_depth"]
             )

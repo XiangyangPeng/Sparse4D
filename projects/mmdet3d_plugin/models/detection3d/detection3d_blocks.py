@@ -119,7 +119,7 @@ class SparseBox3DRefinementModule(BaseModule):
         # 分类
         if return_cls:
             assert self.with_cls_branch, "Without classification layers !!!"
-            cls = self.cls_layers(instance_feature)
+            cls = self.cls_layers(instance_feature) # bs * n_anchor * num_cls
         else:
             cls = None
         return output, cls
